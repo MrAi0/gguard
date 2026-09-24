@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"testing"
+
+	"github.com/MrAi0/goguard/internal/mysql"
 )
 
 // ---------------------------------------------------------------------------
@@ -66,30 +68,7 @@ func (f *failingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// ---------------------------------------------------------------------------
-// STEP 1 - the length decode on its own
-// ---------------------------------------------------------------------------
-
-func TestStep1_LengthDecode(t *testing.T) {
-	cases := []struct {
-		header []byte
-		want   int
-	}{
-		{[]byte{0x00, 0x00, 0x00}, 0},
-		{[]byte{0x09, 0x00, 0x00}, 9},
-		{[]byte{0xff, 0x00, 0x00}, 255},
-		{[]byte{0x00, 0x01, 0x00}, 256},
-		{[]byte{0x2c, 0x01, 0x00}, 300},
-		{[]byte{0x00, 0x00, 0x01}, 65536},
-		{[]byte{0xff, 0xff, 0xff}, 16777215},
-	}
-	for _, c := range cases {
-		got := int(c.header[0]) | int(c.header[1])<<8 | int(c.header[2])<<16
-		if got != c.want {
-			t.Errorf("% x: got %d, want %d", c.header, got, c.want)
-		}
-	}
-}
+// STEP 1 (length decode) lives in internal/mysql as TestPayloadLen.
 
 // ---------------------------------------------------------------------------
 // STEP 2 - one packet in, one identical packet out
@@ -99,7 +78,7 @@ func TestStep2_SinglePacket(t *testing.T) {
 	in := comQuery(0, "SELECT 1")
 
 	var out bytes.Buffer
-	err := pipePackets(&out, bytes.NewReader(in), "client->db")
+	err := relay(&out, bytes.NewReader(in), nil)
 
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected io.EOF at clean end of stream, got %v", err)
@@ -122,7 +101,7 @@ func TestStep3_MultiplePackets(t *testing.T) {
 	in = append(in, buildPacket(5, []byte{0xfe, 0, 0, 0x02, 0})...)    // EOF
 
 	var out bytes.Buffer
-	err := pipePackets(&out, bytes.NewReader(in), "db->client")
+	err := relay(&out, bytes.NewReader(in), nil)
 
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected io.EOF, got %v", err)
@@ -143,7 +122,7 @@ func TestStep4_FragmentedStream(t *testing.T) {
 	// ones: they split the header itself.
 	for chunk := 1; chunk <= 20; chunk++ {
 		var out bytes.Buffer
-		err := pipePackets(&out, &dribbleReader{data: in, n: chunk}, "client->db")
+		err := relay(&out, &dribbleReader{data: in, n: chunk}, nil)
 		if !errors.Is(err, io.EOF) {
 			t.Fatalf("chunk=%d: expected io.EOF, got %v", chunk, err)
 		}
@@ -162,7 +141,7 @@ func TestStep5_ZeroLengthPacket(t *testing.T) {
 	in := buildPacket(7, nil) // 00 00 00 07, no payload
 
 	var out bytes.Buffer
-	err := pipePackets(&out, bytes.NewReader(in), "db->client")
+	err := relay(&out, bytes.NewReader(in), nil)
 
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected io.EOF, got %v", err)
@@ -181,7 +160,7 @@ func TestStep6_TruncatedInput(t *testing.T) {
 
 	t.Run("clean close between packets", func(t *testing.T) {
 		var out bytes.Buffer
-		err := pipePackets(&out, bytes.NewReader(full), "x")
+		err := relay(&out, bytes.NewReader(full), nil)
 		if !errors.Is(err, io.EOF) {
 			t.Errorf("want io.EOF, got %v", err)
 		}
@@ -189,7 +168,15 @@ func TestStep6_TruncatedInput(t *testing.T) {
 
 	t.Run("cut mid-header", func(t *testing.T) {
 		var out bytes.Buffer
-		err := pipePackets(&out, bytes.NewReader(full[:2]), "x")
+		err := relay(&out, bytes.NewReader(full[:2]), nil)
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("want io.ErrUnexpectedEOF, got %v", err)
+		}
+	})
+
+	t.Run("cut right after header", func(t *testing.T) {
+		var out bytes.Buffer
+		err := relay(&out, bytes.NewReader(full[:4]), nil)
 		if !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Errorf("want io.ErrUnexpectedEOF, got %v", err)
 		}
@@ -197,7 +184,7 @@ func TestStep6_TruncatedInput(t *testing.T) {
 
 	t.Run("cut mid-payload", func(t *testing.T) {
 		var out bytes.Buffer
-		err := pipePackets(&out, bytes.NewReader(full[:8]), "x")
+		err := relay(&out, bytes.NewReader(full[:8]), nil)
 		if !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Errorf("want io.ErrUnexpectedEOF, got %v", err)
 		}
@@ -216,7 +203,7 @@ func TestStep7_WriteErrorPropagates(t *testing.T) {
 	in := append(comQuery(0, "SELECT 1"), comQuery(0, "SELECT 2")...)
 
 	w := &failingWriter{failOn: 2} // let the first packet through, fail the second
-	err := pipePackets(w, bytes.NewReader(in), "client->db")
+	err := relay(w, bytes.NewReader(in), nil)
 
 	if !errors.Is(err, errWriteFailed) {
 		t.Fatalf("want errWriteFailed, got %v", err)
@@ -258,12 +245,38 @@ func TestStep8_OverRealTCP(t *testing.T) {
 	defer dbConn.Close()
 
 	clientBytes := comQuery(0, "SELECT 1")
-	if err := pipePackets(dbConn, bytes.NewReader(clientBytes), "client->db"); !errors.Is(err, io.EOF) {
+	if err := relay(dbConn, bytes.NewReader(clientBytes), nil); !errors.Is(err, io.EOF) {
 		t.Fatalf("want io.EOF, got %v", err)
 	}
 
 	got := <-serverGot
 	if !bytes.Equal(got, clientBytes) {
 		t.Errorf("server received % x, want % x", got, clientBytes)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// STEP 9 - the inspect hook sees every packet, in order, before it's forwarded
+// ---------------------------------------------------------------------------
+
+func TestStep9_InspectHook(t *testing.T) {
+	first, second := comQuery(0, "SELECT 1"), comQuery(0, "SELECT 2")
+	in := append(append([]byte{}, first...), second...)
+
+	var out bytes.Buffer
+	var seen [][]byte
+	err := relay(&out, bytes.NewReader(in), func(pkt mysql.Packet) {
+		// copy, so the check below doesn't depend on relay reusing buffers
+		seen = append(seen, append([]byte{}, pkt...))
+		if !bytes.Equal(out.Bytes(), bytes.Join(seen[:len(seen)-1], nil)) {
+			t.Errorf("packet %d was forwarded before inspect ran", len(seen))
+		}
+	})
+
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("want io.EOF, got %v", err)
+	}
+	if len(seen) != 2 || !bytes.Equal(seen[0], first) || !bytes.Equal(seen[1], second) {
+		t.Errorf("inspect saw % x", seen)
 	}
 }
